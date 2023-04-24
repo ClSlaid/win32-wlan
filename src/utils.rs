@@ -1,7 +1,5 @@
-use windows::{
-    core::{wcslen, PCWSTR},
-    Win32::NetworkManagement::WiFi::L2_NOTIFICATION_DATA,
-};
+use windows::core::{wcslen, PCWSTR};
+use windows_sys::Win32::NetworkManagement::WiFi::L2_NOTIFICATION_DATA;
 
 /// convert a vary length array to a Vec
 /// # Note
@@ -36,7 +34,6 @@ pub unsafe extern "system" fn callback_executor(
     callback: *mut std::ffi::c_void,
 ) {
     let callback = callback as *mut Box<dyn FnOnce(*mut L2_NOTIFICATION_DATA)>;
-    // free callback
-    let callback = Box::from_raw(callback);
+    let callback: Box<_> = Box::from_raw(callback);
     callback(data);
 }

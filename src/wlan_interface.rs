@@ -5,6 +5,7 @@ use get_last_error::Win32Error;
 use windows::core::GUID;
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::NetworkManagement::WiFi::*;
+use windows_sys::Win32::NetworkManagement::WiFi::WlanRegisterNotification as wlan_register_notification;
 
 use crate::utils::callback_executor;
 use crate::utils::vary_array_to_vec;
@@ -79,11 +80,13 @@ pub fn query_system_interfaces(handler: &WlanHander) -> Result<Vec<WlanInterface
 
     let mut interface_list: *mut WLAN_INTERFACE_INFO_LIST = std::ptr::null_mut();
     let res = unsafe { WlanEnumInterfaces(handler, None, &mut interface_list) };
+    log::debug!("Querying WLAN interfaces...");
     if res != 0 {
         let err = Win32Error::new(res);
         log::error!("WlanEnumInterfaces Error: {}", err);
         return Err(err);
     }
+    log::debug!("WLAN interfaces queried successfully.");
 
     let os_interface_list = match unsafe { interface_list.as_ref() } {
         Some(interface_list) => interface_list,
@@ -95,10 +98,12 @@ pub fn query_system_interfaces(handler: &WlanHander) -> Result<Vec<WlanInterface
     let vary_arr = &os_interface_list.InterfaceInfo;
     let v = unsafe { vary_array_to_vec(item_cnt, vary_arr) };
 
+    log::debug!("WLAN interfaces: {:#?}", v);
     // free memory of interface list
     unsafe {
         WlanFreeMemory(interface_list as _);
     }
+    log::debug!("Memory of interface list freed.");
 
     Ok(v)
 }
@@ -132,6 +137,12 @@ impl WlanInterface {
     /// Get the connectivity data of the interface
     pub fn connectivity(&self, handle: &WlanHander) -> Result<ConnectivityData, Win32Error> {
         let handle = handle.handle();
+
+        log::debug!(
+            "Querying connectivity data of interface: {}",
+            self.interface_description
+        );
+
         let mut connectivity_data_size: u32 = 0;
         let mut connectivity_data_ptr = std::ptr::null_mut();
 
@@ -152,6 +163,8 @@ impl WlanInterface {
             return Err(err);
         }
 
+        log::debug!("Connectivity data queried successfully.");
+
         let os_connection_attrs =
             unsafe { (connectivity_data_ptr as *const WLAN_CONNECTION_ATTRIBUTES).as_ref() };
 
@@ -160,17 +173,21 @@ impl WlanInterface {
             os_connection_attrs.expect("Cannot acquire connectivity data in interface"),
         );
 
+        log::debug!("Connectivity data: {:#?}", connectivity_data);
+
         // free memory of WLAN_CONNECTION_ATTRIBUTES
         unsafe {
             WlanFreeMemory(connectivity_data_ptr as _);
         }
+        log::debug!("Memory of connectivity data freed.");
 
         Ok(connectivity_data)
     }
 
-    /// Get interface's GUID, and scan WLAN list, get a list of BSS
+    /// scan for available networks
     pub fn blocking_scan(&self, handle: &WlanHander) -> Result<Vec<BssEntry>, Win32Error> {
         let handle = handle.handle();
+        log::debug!("Scanning interface: {}", self.interface_description);
         let res = unsafe { WlanScan(handle, &self.interface_guid, None, None, None) };
         if res != 0 {
             let err = Win32Error::new(res);
@@ -179,26 +196,31 @@ impl WlanInterface {
         }
 
         let mut notify_token = 0;
-
         // wait until underlying scan is finished
         let os_notify_data = {
             let (tx, rx) = mpsc::channel::<*mut L2_NOTIFICATION_DATA>();
             let callback = move |data| {
                 tx.send(data).unwrap();
             };
-            let closure_ptr = Box::leak(Box::new(Box::new(callback))) as *const _ as *mut _;
+            let dyn_closure = Box::new(callback) as Box<dyn FnOnce(*mut L2_NOTIFICATION_DATA)>;
+            let closure_ptr = Box::into_raw(Box::new(dyn_closure)) as *mut _;
+            log::debug!("Registering callback...");
 
             let res = unsafe {
-                WlanRegisterNotification(
-                    handle,
+                wlan_register_notification(
+                    handle.0,
                     WLAN_NOTIFICATION_SOURCE_ACM,
-                    true,
+                    true as i32,
                     Some(callback_executor),
-                    Some(closure_ptr),
-                    None,
-                    Some(&mut notify_token),
+                    closure_ptr,
+                    core::ptr::null_mut(),
+                    &mut notify_token,
                 )
             };
+            println!(
+                "Callback registered successfully. (token: {})",
+                notify_token
+            );
             if res != 0 {
                 let err = Win32Error::new(res);
                 log::error!("WlanRegisterNotification Error: {}", err);
@@ -212,16 +234,17 @@ impl WlanInterface {
 
             // free memory of L2_NOTIFICATION_DATA
             WlanFreeMemory(os_notify_data as _);
+            log::debug!("Memory of L2_NOTIFICATION_DATA freed.");
 
             // unregister notification
-            let res = WlanRegisterNotification(
-                handle,
+            let res = wlan_register_notification(
+                handle.0,
                 WLAN_NOTIFICATION_SOURCE_NONE,
-                true,
+                false as i32,
                 None,
-                None,
-                None,
-                Some(&mut notify_token),
+                std::ptr::null(),
+                std::ptr::null(),
+                &mut notify_token,
             );
 
             // log if error occurs, but we don't care about the error
@@ -230,6 +253,7 @@ impl WlanInterface {
                 log::error!("WlanRegisterNotification Error: {}", err);
             }
         }
+        log::debug!("scan finished.");
 
         let mut os_bss_list: *mut WLAN_BSS_LIST = std::ptr::null_mut();
         let res = unsafe {
@@ -261,11 +285,13 @@ impl WlanInterface {
         };
         // free memory of WLAN_BSS_LIST
         unsafe { WlanFreeMemory(os_bss_list as _) }
+        log::debug!("Memory of WLAN_BSS_LIST freed.");
         Ok(bss_list)
     }
 
     pub async fn scan(&self, handle: &WlanHander) -> Result<Vec<BssEntry>, Win32Error> {
         let handle = handle.handle();
+        log::debug!("Scanning interface: {}", self.interface_description);
         let res = unsafe { WlanScan(handle, &self.interface_guid, None, None, None) };
         if res != 0 {
             let err = Win32Error::new(res);
@@ -274,24 +300,25 @@ impl WlanInterface {
         }
 
         let mut notify_token = 0;
-
         // wait until underlying scan is finished
         let os_notify_data = {
             let (tx, rx) = oneshot::channel::<*mut L2_NOTIFICATION_DATA>();
             let callback = move |data| {
                 tx.send(data).unwrap();
             };
-            let closure_ptr = Box::leak(Box::new(Box::new(callback))) as *const _ as *mut _;
+            let dyn_closure = Box::new(callback) as Box<dyn FnOnce(*mut L2_NOTIFICATION_DATA)>;
+            let closure_ptr = Box::into_raw(Box::new(dyn_closure)) as *mut _;
 
+            log::debug!("Registering callback...");
             let res = unsafe {
-                WlanRegisterNotification(
-                    handle,
+                wlan_register_notification(
+                    handle.0,
                     WLAN_NOTIFICATION_SOURCE_ACM,
-                    true,
+                    true as i32,
                     Some(callback_executor),
-                    Some(closure_ptr),
-                    None,
-                    Some(&mut notify_token),
+                    closure_ptr,
+                    std::ptr::null(),
+                    &mut notify_token,
                 )
             };
             if res != 0 {
@@ -299,6 +326,10 @@ impl WlanInterface {
                 log::error!("WlanRegisterNotification Error: {}", err);
                 return Err(err);
             }
+            println!(
+                "Callback registered successfully. (token: {})",
+                notify_token
+            );
             rx.await.unwrap()
         };
 
@@ -307,16 +338,16 @@ impl WlanInterface {
 
             // free memory of L2_NOTIFICATION_DATA
             WlanFreeMemory(os_notify_data as _);
+            log::debug!("Memory of L2_NOTIFICATION_DATA freed.");
 
-            // unregister notification
-            let res = WlanRegisterNotification(
-                handle,
+            let res = wlan_register_notification(
+                handle.0,
                 WLAN_NOTIFICATION_SOURCE_NONE,
-                true,
+                false as i32,
                 None,
-                None,
-                None,
-                Some(&mut notify_token),
+                std::ptr::null(),
+                std::ptr::null(),
+                &mut notify_token,
             );
 
             // log if error occurs, but we don't care about the error
@@ -325,6 +356,8 @@ impl WlanInterface {
                 log::error!("WlanRegisterNotification Error: {}", err);
             }
         }
+
+        log::debug!("scan finished.");
 
         let mut os_bss_list: *mut WLAN_BSS_LIST = std::ptr::null_mut();
         let res = unsafe {
@@ -357,6 +390,7 @@ impl WlanInterface {
 
         // free memory of WLAN_BSS_LIST
         unsafe { WlanFreeMemory(os_bss_list as _) }
+        log::debug!("Memory of WLAN_BSS_LIST freed.");
         Ok(bss_list)
     }
 }
@@ -424,6 +458,7 @@ impl From<WlanState> for WLAN_INTERFACE_STATE {
 }
 
 /// Wrapper for WLAN_CONNECTION_ATTRIBUTES
+#[derive(Debug)]
 pub struct ConnectivityData {
     profile_name: String,
     state: WlanState,
