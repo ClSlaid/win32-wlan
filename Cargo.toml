@@ -18,3 +18,4 @@ windows = {version = "0.48.0", features = [
 ]}
 log = "0.4.17"
 get-last-error = { version = "0.1.1" }
+futures = "0.3.28"

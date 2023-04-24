@@ -10,6 +10,7 @@ Try this crate instead.
 
 ## TODO
 
+- [x] WLAN scanning support
+- [x] asynchronous
 - [ ] 802.11 information frame parsing
-- [ ] asynchronous running (current implementation needs to sleep a thread,
-      which is not acceptable)
+- [ ] WLAN connect

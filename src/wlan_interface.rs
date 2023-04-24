@@ -1,8 +1,14 @@
-use crate::{vary_array_to_vec, vary_utf16_to_string};
+use std::sync::mpsc;
+
+use futures::channel::oneshot;
 use get_last_error::Win32Error;
 use windows::core::GUID;
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::NetworkManagement::WiFi::*;
+
+use crate::utils::callback_executor;
+use crate::utils::vary_array_to_vec;
+use crate::utils::vary_utf16_to_string;
 
 /// Win32 WLAN API Hander
 ///
@@ -18,6 +24,12 @@ use windows::Win32::NetworkManagement::WiFi::*;
 pub struct WlanHander {
     handle: HANDLE,
     negotiated_version: u32,
+}
+
+impl Default for WlanHander {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl WlanHander {
@@ -61,63 +73,45 @@ impl Drop for WlanHander {
     }
 }
 
-/// Wrapper for WLAN_INTERFACE_INFO_LIST
+/// Get all WLAN interfaces from win32 api
+pub fn query_system_interfaces(handler: &WlanHander) -> Result<Vec<WlanInterface>, Win32Error> {
+    let handler = handler.handle();
 
-#[derive(Clone, Debug)]
-#[cfg_attr(feature = "serde", derive(Serialize))]
-pub struct InterfaceInfoList {
-    interface_infos: Vec<InterfaceInfo>,
-}
+    let mut interface_list: *mut WLAN_INTERFACE_INFO_LIST = std::ptr::null_mut();
+    let res = unsafe { WlanEnumInterfaces(handler, None, &mut interface_list) };
+    if res != 0 {
+        let err = Win32Error::new(res);
+        log::error!("WlanEnumInterfaces Error: {}", err);
+        return Err(err);
+    }
 
-impl InterfaceInfoList {
-    /// Get all WLAN interfaces from win32 api
-    pub fn query_system_interfaces(handler: &WlanHander) -> Result<Self, Win32Error> {
-        let handler = handler.handle();
-        let mut interface_list: *mut WLAN_INTERFACE_INFO_LIST = std::ptr::null_mut();
-        let res = unsafe { WlanEnumInterfaces(handler, None, &mut interface_list) };
-        if res != 0 {
-            let err = Win32Error::new(res);
-            log::error!("WlanEnumInterfaces Error: {}", err);
-            return Err(err);
+    let os_interface_list = match unsafe { interface_list.as_ref() } {
+        Some(interface_list) => interface_list,
+        None => {
+            return Ok(vec![]);
         }
-        let interface_infos = unsafe {
-            let os_interface_list = match interface_list.as_ref() {
-                Some(interface_list) => interface_list,
-                None => {
-                    let list = vec![];
-                    return Ok(Self {
-                        interface_infos: list,
-                    });
-                }
-            };
-            let item_cnt = os_interface_list.dwNumberOfItems as usize;
-            let vary_arr = os_interface_list.InterfaceInfo;
-            vary_array_to_vec(item_cnt, vary_arr)
-        };
+    };
+    let item_cnt = os_interface_list.dwNumberOfItems as usize;
+    let vary_arr = &os_interface_list.InterfaceInfo;
+    let v = unsafe { vary_array_to_vec(item_cnt, vary_arr) };
 
-        Ok(Self { interface_infos })
+    // free memory of interface list
+    unsafe {
+        WlanFreeMemory(interface_list as _);
     }
 
-    /// as iterator
-    fn iter(&self) -> std::slice::Iter<InterfaceInfo> {
-        self.interface_infos.iter()
-    }
-
-    /// Get the length of the interface list
-    pub fn len(&self) -> usize {
-        self.interface_infos.len()
-    }
+    Ok(v)
 }
 
 /// Wrapper for WLAN_INTERFACE_INFO
 #[derive(Clone, Debug)]
-pub struct InterfaceInfo {
+pub struct WlanInterface {
     interface_guid: GUID,
     interface_description: String,
     state: WlanState,
 }
 // getters of interface info
-impl InterfaceInfo {
+impl WlanInterface {
     /// Get the GUID of the interface
     pub fn guid(&self) -> GUID {
         self.interface_guid
@@ -134,7 +128,7 @@ impl InterfaceInfo {
     }
 }
 
-impl InterfaceInfo {
+impl WlanInterface {
     /// Get the connectivity data of the interface
     pub fn connectivity(&self, handle: &WlanHander) -> Result<ConnectivityData, Win32Error> {
         let handle = handle.handle();
@@ -158,15 +152,24 @@ impl InterfaceInfo {
             return Err(err);
         }
 
-        // error is handlered, so the ptr should be non-null
-        let connectivity_data =
-            unsafe { connectivity_data_ptr as *const WLAN_CONNECTION_ATTRIBUTES };
-        let connectivity_data = ConnectivityData::from(connectivity_data);
+        let os_connection_attrs =
+            unsafe { (connectivity_data_ptr as *const WLAN_CONNECTION_ATTRIBUTES).as_ref() };
+
+        // error is handlered, so the ptr should be non-null, if is null then panic
+        let connectivity_data = ConnectivityData::from(
+            os_connection_attrs.expect("Cannot acquire connectivity data in interface"),
+        );
+
+        // free memory of WLAN_CONNECTION_ATTRIBUTES
+        unsafe {
+            WlanFreeMemory(connectivity_data_ptr as _);
+        }
+
         Ok(connectivity_data)
     }
 
     /// Get interface's GUID, and scan WLAN list, get a list of BSS
-    pub fn scan(&self, handle: &WlanHander) -> Result<BssList, Win32Error> {
+    pub fn blocking_scan(&self, handle: &WlanHander) -> Result<Vec<BssEntry>, Win32Error> {
         let handle = handle.handle();
         let res = unsafe { WlanScan(handle, &self.interface_guid, None, None, None) };
         if res != 0 {
@@ -175,8 +178,58 @@ impl InterfaceInfo {
             return Err(err);
         }
 
+        let mut notify_token = 0;
+
         // wait until underlying scan is finished
-        std::thread::sleep(std::time::Duration::from_secs(4));
+        let os_notify_data = {
+            let (tx, rx) = mpsc::channel::<*mut L2_NOTIFICATION_DATA>();
+            let callback = move |data| {
+                tx.send(data).unwrap();
+            };
+            let closure_ptr = Box::leak(Box::new(Box::new(callback))) as *const _ as *mut _;
+
+            let res = unsafe {
+                WlanRegisterNotification(
+                    handle,
+                    WLAN_NOTIFICATION_SOURCE_ACM,
+                    true,
+                    Some(callback_executor),
+                    Some(closure_ptr),
+                    None,
+                    Some(&mut notify_token),
+                )
+            };
+            if res != 0 {
+                let err = Win32Error::new(res);
+                log::error!("WlanRegisterNotification Error: {}", err);
+                return Err(err);
+            }
+            rx.recv().unwrap()
+        };
+
+        unsafe {
+            // todo: check notification data
+
+            // free memory of L2_NOTIFICATION_DATA
+            WlanFreeMemory(os_notify_data as _);
+
+            // unregister notification
+            let res = WlanRegisterNotification(
+                handle,
+                WLAN_NOTIFICATION_SOURCE_NONE,
+                true,
+                None,
+                None,
+                None,
+                Some(&mut notify_token),
+            );
+
+            // log if error occurs, but we don't care about the error
+            if res != 0 {
+                let err = Win32Error::new(res);
+                log::error!("WlanRegisterNotification Error: {}", err);
+            }
+        }
 
         let mut os_bss_list: *mut WLAN_BSS_LIST = std::ptr::null_mut();
         let res = unsafe {
@@ -196,17 +249,119 @@ impl InterfaceInfo {
             return Err(err);
         }
 
-        let os_bss_list = unsafe { os_bss_list.as_ref() };
+        let bss_list_ref = unsafe { os_bss_list.as_ref() };
 
-        let bss_list = match os_bss_list {
-            Some(bss_list) => BssList::from(bss_list),
-            None => BssList::new_empty(),
+        let bss_list = match bss_list_ref {
+            Some(bss_list) => {
+                let length = bss_list.dwNumberOfItems as usize;
+                let bss_list = &bss_list.wlanBssEntries;
+                unsafe { vary_array_to_vec(length, bss_list) }
+            }
+            None => vec![],
         };
+        // free memory of WLAN_BSS_LIST
+        unsafe { WlanFreeMemory(os_bss_list as _) }
+        Ok(bss_list)
+    }
+
+    pub async fn scan(&self, handle: &WlanHander) -> Result<Vec<BssEntry>, Win32Error> {
+        let handle = handle.handle();
+        let res = unsafe { WlanScan(handle, &self.interface_guid, None, None, None) };
+        if res != 0 {
+            let err = Win32Error::new(res);
+            log::error!("WlanScan Error: {}", err);
+            return Err(err);
+        }
+
+        let mut notify_token = 0;
+
+        // wait until underlying scan is finished
+        let os_notify_data = {
+            let (tx, rx) = oneshot::channel::<*mut L2_NOTIFICATION_DATA>();
+            let callback = move |data| {
+                tx.send(data).unwrap();
+            };
+            let closure_ptr = Box::leak(Box::new(Box::new(callback))) as *const _ as *mut _;
+
+            let res = unsafe {
+                WlanRegisterNotification(
+                    handle,
+                    WLAN_NOTIFICATION_SOURCE_ACM,
+                    true,
+                    Some(callback_executor),
+                    Some(closure_ptr),
+                    None,
+                    Some(&mut notify_token),
+                )
+            };
+            if res != 0 {
+                let err = Win32Error::new(res);
+                log::error!("WlanRegisterNotification Error: {}", err);
+                return Err(err);
+            }
+            rx.await.unwrap()
+        };
+
+        unsafe {
+            // todo: check notification data
+
+            // free memory of L2_NOTIFICATION_DATA
+            WlanFreeMemory(os_notify_data as _);
+
+            // unregister notification
+            let res = WlanRegisterNotification(
+                handle,
+                WLAN_NOTIFICATION_SOURCE_NONE,
+                true,
+                None,
+                None,
+                None,
+                Some(&mut notify_token),
+            );
+
+            // log if error occurs, but we don't care about the error
+            if res != 0 {
+                let err = Win32Error::new(res);
+                log::error!("WlanRegisterNotification Error: {}", err);
+            }
+        }
+
+        let mut os_bss_list: *mut WLAN_BSS_LIST = std::ptr::null_mut();
+        let res = unsafe {
+            WlanGetNetworkBssList(
+                handle,
+                &self.interface_guid,
+                None,
+                dot11_BSS_type_any,
+                false,
+                None,
+                &mut os_bss_list,
+            )
+        };
+        if res != 0 {
+            let err = Win32Error::new(res);
+            log::error!("WlanGetNetworkBssList Error: {}", err);
+            return Err(err);
+        }
+
+        let bss_list_ref = unsafe { os_bss_list.as_ref() };
+
+        let bss_list = match bss_list_ref {
+            Some(bss_list) => {
+                let length = bss_list.dwNumberOfItems as usize;
+                let bss_list = &bss_list.wlanBssEntries;
+                unsafe { vary_array_to_vec(length, bss_list) }
+            }
+            None => vec![],
+        };
+
+        // free memory of WLAN_BSS_LIST
+        unsafe { WlanFreeMemory(os_bss_list as _) }
         Ok(bss_list)
     }
 }
 
-impl From<&WLAN_INTERFACE_INFO> for InterfaceInfo {
+impl From<&WLAN_INTERFACE_INFO> for WlanInterface {
     fn from(interface: &WLAN_INTERFACE_INFO) -> Self {
         let interface_guid = interface.InterfaceGuid;
 
@@ -233,6 +388,8 @@ pub enum WlanState {
     Authenticating,
 }
 
+// that's windows to blame, allow this
+#[allow(non_upper_case_globals)]
 impl From<WLAN_INTERFACE_STATE> for WlanState {
     fn from(state: WLAN_INTERFACE_STATE) -> Self {
         match state {
@@ -249,6 +406,8 @@ impl From<WLAN_INTERFACE_STATE> for WlanState {
     }
 }
 
+// that's windows to blame, allow this
+#[allow(non_upper_case_globals)]
 impl From<WlanState> for WLAN_INTERFACE_STATE {
     fn from(state: WlanState) -> Self {
         match state {
@@ -317,8 +476,8 @@ impl From<&WLAN_CONNECTION_ATTRIBUTES> for ConnectivityData {
             let ssid = attrs.dot11Ssid.ucSSID.as_ptr();
             let len = attrs.dot11Ssid.uSSIDLength as usize;
             let ssid = std::slice::from_raw_parts(ssid, len);
-            let ssid = String::from_utf8(ssid.to_vec()).unwrap();
-            ssid
+
+            String::from_utf8(ssid.to_vec()).unwrap()
         };
         let bss_id = attrs.dot11Bssid;
         let bss_id = format!(
@@ -338,76 +497,6 @@ impl From<&WLAN_CONNECTION_ATTRIBUTES> for ConnectivityData {
             rx_rate,
             tx_rate,
         }
-    }
-}
-
-// from *const WLAN_CONNECTION_ATTRIBUTES to ConnectivityData
-// fully read the data, unsafely, from the pointer, to avoid copy and truncate.
-// this is safe because the pointer is from the same process
-impl From<*const WLAN_CONNECTION_ATTRIBUTES> for ConnectivityData {
-    fn from(connectivity_data: *const WLAN_CONNECTION_ATTRIBUTES) -> Self {
-        // do not use From<&WLAN_CONNECTION_ATTRIBUTES> for ConnectivityData
-        // this will cause truncation
-        let profile_name = unsafe {
-            let profile_name = (*connectivity_data).strProfileName.as_ptr();
-            let len = (*connectivity_data).strProfileName.len();
-            let profile_name = std::slice::from_raw_parts(profile_name, len);
-            let profile_name = String::from_utf16(profile_name).unwrap();
-            let profile_name = profile_name.trim_end_matches(char::from(0)).to_string();
-            profile_name
-        };
-        let state = WlanState::from(unsafe { (*connectivity_data).isState });
-        let attrs = unsafe { (*connectivity_data).wlanAssociationAttributes };
-        let ssid = unsafe {
-            let ssid = attrs.dot11Ssid.ucSSID.as_ptr();
-            let len = attrs.dot11Ssid.uSSIDLength as usize;
-            let ssid = std::slice::from_raw_parts(ssid, len);
-            let ssid = String::from_utf8(ssid.to_vec()).unwrap();
-            ssid
-        };
-        let bss_id = attrs.dot11Bssid;
-        let bss_id = format!(
-            "{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
-            bss_id[0], bss_id[1], bss_id[2], bss_id[3], bss_id[4], bss_id[5]
-        );
-        let signal_quality = attrs.wlanSignalQuality;
-        let rx_rate = attrs.ulRxRate;
-        let tx_rate = attrs.ulTxRate;
-
-        Self {
-            profile_name,
-            state,
-            ssid,
-            bss_id,
-            signal_quality,
-            rx_rate,
-            tx_rate,
-        }
-    }
-}
-
-/// Wrapper for WLAN_BSS_LIST
-///
-/// Also a iterator of BssEntry
-#[derive(Debug)]
-pub struct BssList {
-    entries: Vec<BssEntry>,
-}
-
-impl BssList {
-    pub(crate) fn new_empty() -> Self {
-        Self { entries: vec![] }
-    }
-
-    pub fn iter(&self) -> std::slice::Iter<BssEntry> {
-        self.entries.iter()
-    }
-}
-
-impl From<&WLAN_BSS_LIST> for BssList {
-    fn from(bss_list: &WLAN_BSS_LIST) -> Self {
-        let entries = vary_array_to_vec(bss_list.dwNumberOfItems as usize, bss_list.wlanBssEntries);
-        Self { entries }
     }
 }
 
@@ -436,75 +525,31 @@ impl BssEntry {
             Some(&self.ssid)
         }
     }
+    /// BSS network identifier
     pub fn bss_id(&self) -> &str {
         &self.bss_id
     }
+    /// Received signal strength (dBm)
     pub fn rssi(&self) -> i32 {
         self.rssi
     }
+    /// Link quality (percentage)
     pub fn link_quality(&self) -> u32 {
         self.link_quality
     }
+    /// Center frequency of the channel (MHz)
     pub fn ch_center_frequency(&self) -> u32 {
         self.ch_center_frequency
     }
+    /// Rate set of the BSS network (Mbps)
     pub fn rate_set(&self) -> &[f32] {
         &self.rate_set
     }
+    /// 802.11 information frame
+    ///
+    /// TODO: parsing
     pub fn information_frame(&self) -> &[u8] {
         &self.information_frame
-    }
-}
-
-impl From<*const WLAN_BSS_ENTRY> for BssEntry {
-    fn from(bss_entry: *const WLAN_BSS_ENTRY) -> Self {
-        let ssid = unsafe {
-            let ssid = (*bss_entry).dot11Ssid.ucSSID.as_ptr();
-            let len = (*bss_entry).dot11Ssid.uSSIDLength as usize;
-            let ssid = std::slice::from_raw_parts(ssid, len);
-            let ssid = String::from_utf8(ssid.to_vec()).unwrap();
-            ssid
-        };
-        let bss_id = (unsafe { *bss_entry }).dot11Bssid;
-        let bss_id = format!(
-            "{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
-            bss_id[0], bss_id[1], bss_id[2], bss_id[3], bss_id[4], bss_id[5]
-        );
-        let rssi = (unsafe { *bss_entry }).lRssi;
-        let link_quality = (unsafe { *bss_entry }).uLinkQuality;
-        let ch_center_frequency = (unsafe { *bss_entry }).ulChCenterFrequency;
-        // get rate set from WLAN_RATE_SET
-        let rate_set: Vec<u16> = unsafe {
-            let rate_set = (*bss_entry).wlanRateSet;
-            let rate_set = std::slice::from_raw_parts(
-                rate_set.usRateSet.as_ptr(),
-                rate_set.uRateSetLength as usize,
-            );
-            let rate_set = rate_set.to_vec();
-            rate_set
-        };
-        // (rateSet[i] & 0x7FFF) * 0.5
-        let rate_set = rate_set
-            .into_iter()
-            .map(|x| (x & 0x7FFF) as f32 * 0.5)
-            .collect();
-        let information_frame = unsafe {
-            let information_frame = (bss_entry as *const u8).add((*bss_entry).ulIeOffset as usize);
-            let len = (*bss_entry).ulIeSize as usize;
-            let information_frame = std::slice::from_raw_parts(information_frame, len);
-            let information_frame = information_frame.to_vec();
-            information_frame
-        };
-
-        Self {
-            ssid,
-            bss_id,
-            rssi,
-            link_quality,
-            ch_center_frequency,
-            rate_set,
-            information_frame,
-        }
     }
 }
 
@@ -514,15 +559,15 @@ impl From<&WLAN_BSS_ENTRY> for BssEntry {
             let ssid = os_bss_entry.dot11Ssid.ucSSID.as_ptr();
             let len = os_bss_entry.dot11Ssid.uSSIDLength as usize;
             let ssid = std::slice::from_raw_parts(ssid, len);
-            let ssid = String::from_utf8(ssid.to_vec()).unwrap();
-            ssid
+
+            String::from_utf8(ssid.to_vec()).unwrap()
         };
         let bss_id = os_bss_entry.dot11Bssid;
         let bss_id = format!(
             "{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
             bss_id[0], bss_id[1], bss_id[2], bss_id[3], bss_id[4], bss_id[5]
         );
-        let phy_type = os_bss_entry.dot11BssPhyType;
+        let _phy_type = os_bss_entry.dot11BssPhyType;
         let rssi = os_bss_entry.lRssi;
         let link_quality = os_bss_entry.uLinkQuality;
         let ch_center_frequency = os_bss_entry.ulChCenterFrequency;
@@ -530,7 +575,7 @@ impl From<&WLAN_BSS_ENTRY> for BssEntry {
             // get rate_set u16[126] first
             let rate_set: *const u16 = os_bss_entry.wlanRateSet.usRateSet.as_ptr();
             // get rate_set length
-            let len = (*os_bss_entry).wlanRateSet.uRateSetLength as usize;
+            let len = os_bss_entry.wlanRateSet.uRateSetLength as usize;
             let rate_set = std::slice::from_raw_parts(rate_set, len);
             let rate_set = rate_set
                 .iter()
@@ -543,8 +588,8 @@ impl From<&WLAN_BSS_ENTRY> for BssEntry {
                 .add(os_bss_entry.ulIeOffset as usize);
             let len = os_bss_entry.ulIeSize as usize;
             let information_frame = std::slice::from_raw_parts(information_frame, len);
-            let information_frame = information_frame.to_vec();
-            information_frame
+
+            information_frame.to_vec()
         };
 
         Self {
