@@ -1,0 +1,20 @@
+[package]
+name = "win32-wlan"
+version = "0.1.0"
+edition = "2021"
+description = "Higher level Rust bindings for the Win32 WLAN API"
+categories = ["api-bindings", "wlan", "windows", "win32"]
+authors = ["Cai Lue <cailue@bupt.edu.cn>"]
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[features]
+default = []
+
+[dependencies]
+windows = {version = "0.48.0", features = [
+    "Win32_Foundation",
+    "Win32_Networking_WinHttp",
+    "Win32_NetworkManagement_WiFi"
+]}
+log = "0.4.17"
+get-last-error = { version = "0.1.1" }
