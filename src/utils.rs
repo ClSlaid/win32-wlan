@@ -1,5 +1,4 @@
 use windows::core::{wcslen, PCWSTR};
-use windows_sys::Win32::NetworkManagement::WiFi::L2_NOTIFICATION_DATA;
 
 /// convert a vary length array to a Vec
 /// # Note
@@ -9,10 +8,10 @@ pub unsafe fn vary_array_to_vec<Origin, To>(length: usize, vary_arr: &[Origin]) 
 where
     for<'a> To: From<&'a Origin>,
 {
-    let reference = &vary_arr[0] as *const Origin;
+    let reference = std::ptr::addr_of!(vary_arr[0]);
 
     let slc = std::slice::from_raw_parts(reference, length);
-    let v = slc.iter().map(|x| x.into()).collect::<Vec<To>>();
+    let v = slc.iter().map(std::convert::Into::into).collect::<Vec<To>>();
 
     v
 }
@@ -26,14 +25,4 @@ pub fn vary_utf16_to_string(utf16_str: &[u16]) -> String {
         std::slice::from_raw_parts(ptr, len)
     };
     String::from_utf16_lossy(slice)
-}
-
-/// callback executor function
-pub unsafe extern "system" fn callback_executor(
-    data: *mut L2_NOTIFICATION_DATA,
-    callback: *mut std::ffi::c_void,
-) {
-    let callback = callback as *mut Box<dyn FnOnce(*mut L2_NOTIFICATION_DATA)>;
-    let callback: Box<_> = Box::from_raw(callback);
-    callback(data);
 }
